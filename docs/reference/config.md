@@ -282,6 +282,9 @@ Each mapping in the `rules` collection has the following keys:
   - A [Common Expression Language (CEL)](https://github.com/google/cel-spec) expression. Required.
 - `message`:
   - An optional message shown when this rule evaluates to `true`.
+- `severity`:
+  - An optional severity (`info`, `warning` or `error`, default `error`) used by
+    the [vet audit workflow](../howto/vet.md#audit-workflow).
 
 See the [vet](../howto/vet.md) documentation for a list of built-in rules and
 help writing custom rules.

@@ -17,9 +17,9 @@ import (
 	"sync"
 	"time"
 
-	_ "github.com/go-sql-driver/mysql"
 	"cel.dev/cel-go/cel"
 	"cel.dev/cel-go/ext"
+	_ "github.com/go-sql-driver/mysql"
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
 	"google.golang.org/protobuf/encoding/protojson"
@@ -35,6 +35,7 @@ import (
 	"github.com/sqlc-dev/sqlc/internal/sql/sqlpath"
 	"github.com/sqlc-dev/sqlc/internal/sqlcdebug"
 	"github.com/sqlc-dev/sqlc/internal/vet"
+	"github.com/sqlc-dev/sqlc/internal/vetaudit"
 )
 
 var (
@@ -48,7 +49,7 @@ var ErrFailedChecks = errors.New("failed checks")
 var pjson = protojson.UnmarshalOptions{AllowPartial: true, DiscardUnknown: true}
 
 func NewCmdVet() *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "vet",
 		Short: "Vet examines queries",
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -57,7 +58,14 @@ func NewCmdVet() *cobra.Command {
 			opts := &Options{
 				Env:    ParseEnv(cmd),
 				Stderr: stderr,
+				Stdout: cmd.OutOrStdout(),
 			}
+			audit, err := auditOptionsFromFlags(cmd)
+			if err != nil {
+				fmt.Fprintf(stderr, "%s\n", err)
+				os.Exit(1)
+			}
+			opts.Audit = audit
 			dir, name := getConfigPath(stderr, cmd.Flag("file"))
 			if err := Vet(cmd.Context(), dir, name, opts); err != nil {
 				if !errors.Is(err, ErrFailedChecks) {
@@ -68,6 +76,56 @@ func NewCmdVet() *cobra.Command {
 			return nil
 		},
 	}
+	cmd.Flags().String("audit-baseline", "", "enable the audit flow using the baseline file at `path`")
+	cmd.Flags().Bool("audit-update", false, "replace the audit baseline with the current results instead of comparing")
+	cmd.Flags().String("audit-report", "", "write the text audit report to `path`")
+	cmd.Flags().String("audit-json", "", "write the JSON audit report to `path`")
+	cmd.Flags().StringSlice("audit-package", nil, "audit only the named package `name` (repeatable)")
+	cmd.Flags().StringSlice("audit-rule", nil, "audit only the named rule `name` (repeatable)")
+	cmd.Flags().StringSlice("audit-change", nil, "include only changes of `type` (new|resolved|unchanged|moved|message|severity; repeatable)")
+	cmd.Flags().String("audit-fail-on", "", "fail when a gated change reaches severity `level` (info|warning|error; default error)")
+	return cmd
+}
+
+// auditOptionsFromFlags builds AuditOptions from the cobra flags. Audit
+// flags without --audit-baseline are rejected so the flow stays
+// explicitly opt-in.
+func auditOptionsFromFlags(cmd *cobra.Command) (*AuditOptions, error) {
+	baseline, _ := cmd.Flags().GetString("audit-baseline")
+	flagNames := []string{
+		"audit-update", "audit-report", "audit-json",
+		"audit-package", "audit-rule", "audit-change", "audit-fail-on",
+	}
+	otherSet := false
+	for _, name := range flagNames {
+		if cmd.Flags().Changed(name) {
+			otherSet = true
+			break
+		}
+	}
+	if baseline == "" {
+		if otherSet {
+			return nil, fmt.Errorf("audit flags require --audit-baseline to enable the audit flow")
+		}
+		return nil, nil
+	}
+	update, _ := cmd.Flags().GetBool("audit-update")
+	report, _ := cmd.Flags().GetString("audit-report")
+	jsonReport, _ := cmd.Flags().GetString("audit-json")
+	packages, _ := cmd.Flags().GetStringSlice("audit-package")
+	rules, _ := cmd.Flags().GetStringSlice("audit-rule")
+	changes, _ := cmd.Flags().GetStringSlice("audit-change")
+	failOn, _ := cmd.Flags().GetString("audit-fail-on")
+	return &AuditOptions{
+		BaselinePath: baseline,
+		Update:       update,
+		ReportPath:   report,
+		JSONPath:     jsonReport,
+		Packages:     packages,
+		Rules:        rules,
+		Changes:      changes,
+		FailOn:       failOn,
+	}, nil
 }
 
 func Vet(ctx context.Context, dir, filename string, opts *Options) error {
@@ -116,7 +174,13 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 	}
 
 	rules := map[string]rule{
-		constants.QueryRuleDbPrepare: {NeedsPrepare: true},
+		constants.QueryRuleDbPrepare: {
+			NeedsPrepare: true,
+			Severity:     vetaudit.DefaultSeverity,
+		},
+	}
+	ruleDefs := map[string]config.Rule{
+		constants.QueryRuleDbPrepare: {Name: constants.QueryRuleDbPrepare, Severity: string(vetaudit.DefaultSeverity)},
 	}
 
 	for _, c := range conf.Rules {
@@ -129,6 +193,10 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 		if c.Rule == "" {
 			return fmt.Errorf("type-check error: %s is empty", c.Name)
 		}
+		severity, err := vetaudit.NormalizeSeverity(c.Severity)
+		if err != nil {
+			return fmt.Errorf("type-check error: rule %s: %w", c.Name, err)
+		}
 		ast, issues := env.Compile(c.Rule)
 		if issues != nil && issues.Err() != nil {
 			return fmt.Errorf("type-check error: %s %s", c.Name, issues.Err())
@@ -137,7 +205,7 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 		if err != nil {
 			return fmt.Errorf("program construction error: %s %s", c.Name, err)
 		}
-		rule := rule{Program: &prg, Message: c.Msg}
+		rule := rule{Program: &prg, Message: c.Msg, Severity: severity}
 
 		// TODO There's probably a nicer way to do this from the ast
 		// https://pkg.go.dev/cel.dev/cel-go/common/ast#AllMatcher
@@ -147,6 +215,26 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 		}
 
 		rules[c.Name] = rule
+		ruleDefs[c.Name] = config.Rule{Name: c.Name, Rule: c.Rule, Msg: c.Msg, Severity: string(severity)}
+	}
+
+	packageNames := make([]string, len(conf.SQL))
+	for i, sql := range conf.SQL {
+		packageNames[i] = vetPackageName(*conf, sql, i)
+	}
+	ruleNames := make([]string, 0, len(rules))
+	for name := range rules {
+		ruleNames = append(ruleNames, name)
+	}
+
+	var audit *auditPlan
+	var collector *auditCollector
+	if opts.Audit != nil {
+		audit, err = prepareAudit(opts.Audit, dir, packageNames, ruleNames)
+		if err != nil {
+			return err
+		}
+		collector = &auditCollector{}
 	}
 
 	c := checker{
@@ -157,20 +245,45 @@ func Vet(ctx context.Context, dir, filename string, opts *Options) error {
 		Stderr:        stderr,
 		OnlyManagedDB: debugDatabases.Value() == "managed",
 		Replacer:      shfmt.NewReplacer(nil),
+		Audit:         collector,
+		AuditRules:    auditRuleScope(audit),
 	}
 	errored := false
-	for _, sql := range conf.SQL {
-		if err := c.checkSQL(ctx, sql); err != nil {
+	for i, sql := range conf.SQL {
+		if audit != nil && !audit.includesPackage(packageNames[i]) {
+			continue
+		}
+		if err := c.checkSQL(ctx, sql, packageNames[i]); err != nil {
 			if !errors.Is(err, ErrFailedChecks) {
 				fmt.Fprintf(stderr, "%s\n", err)
 			}
 			errored = true
 		}
 	}
+	if audit != nil {
+		if errored {
+			collector.printFailures(stderr)
+			return ErrFailedChecks
+		}
+		return runAudit(audit, configPath, conf, ruleDefs, packageNames, collector, opts.Stdout, stderr)
+	}
 	if errored {
 		return ErrFailedChecks
 	}
 	return nil
+}
+
+// vetPackageName returns the deterministic identity of a configured SQL
+// package: its explicit name, else its generated Go package name, else a
+// stable package_N label.
+func vetPackageName(conf config.Config, s config.SQL, idx int) string {
+	if s.Name != "" {
+		return s.Name
+	}
+	if combo := config.Combine(conf, s); combo.Go.Package != "" {
+		return combo.Go.Package
+	}
+	return fmt.Sprintf("package_%d", idx+1)
 }
 
 type preparer interface {
@@ -382,8 +495,32 @@ func (me *mysqlExplainer) Explain(ctx context.Context, query string, args ...*pl
 type rule struct {
 	Program      *cel.Program
 	Message      string
+	Severity     vetaudit.Severity
 	NeedsPrepare bool
 	NeedsExplain bool
+}
+
+// auditCollector gathers structured vet diagnostics while an audit is
+// enabled. Findings are tripped rules; failures are errors that prevented
+// rules from running at all and therefore abort the audit without
+// touching any baseline or report.
+type auditCollector struct {
+	findings []vetaudit.Diagnostic
+	failures []string
+}
+
+func (a *auditCollector) finding(d vetaudit.Diagnostic) {
+	a.findings = append(a.findings, d)
+}
+
+func (a *auditCollector) fail(format string, args ...any) {
+	a.failures = append(a.failures, fmt.Sprintf(format, args...))
+}
+
+func (a *auditCollector) printFailures(w io.Writer) {
+	for _, msg := range a.failures {
+		fmt.Fprintf(w, "%s\n", msg)
+	}
 }
 
 type checker struct {
@@ -396,6 +533,15 @@ type checker struct {
 	Client        dbmanager.Client
 	clientOnce    sync.Once
 	Replacer      *shfmt.Replacer
+
+	// Audit is non-nil only when the audit flow is enabled.
+	Audit *auditCollector
+	// AuditRules restricts rule evaluation to the audited rule set. A
+	// nil map means every configured rule runs.
+	AuditRules map[string]struct{}
+	// Pkg is the package identity for the package currently being
+	// checked.
+	Pkg string
 }
 
 // isInMemorySQLite checks if a SQLite URI refers to an in-memory database
@@ -469,7 +615,8 @@ func (c *checker) DSN(dsn string) (string, error) {
 	return c.Replacer.Replace(dsn), nil
 }
 
-func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
+func (c *checker) checkSQL(ctx context.Context, s config.SQL, pkg string) error {
+	c.Pkg = pkg
 	// TODO: Create a separate function for this logic so we can
 	combo := config.Combine(*c.Conf, s)
 
@@ -485,6 +632,10 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 		joined = append(joined, filepath.Join(c.Dir, q))
 	}
 	s.Queries = joined
+
+	// Best-effort, deterministic statement positions used only by the
+	// audit flow.
+	locator := newQueryLocator(s.Queries)
 
 	var name string
 	parseOpts := opts.Parser{}
@@ -602,65 +753,105 @@ func (c *checker) checkSQL(ctx context.Context, s config.SQL) error {
 				if debug.Active {
 					log.Printf("Skipping vet rule %q for query: %s\n", name, query.Name)
 				}
-			} else {
-				rule, ok := c.Rules[name]
-				if !ok {
-					return fmt.Errorf("type-check error: a rule with the name '%s' does not exist", name)
+				continue
+			}
+			if c.AuditRules != nil {
+				if _, ok := c.AuditRules[name]; !ok {
+					continue
 				}
+			}
+			rule, ok := c.Rules[name]
+			if !ok {
+				return fmt.Errorf("type-check error: a rule with the name '%s' does not exist", name)
+			}
 
-				if rule.NeedsPrepare {
-					if prep == nil {
+			if rule.NeedsPrepare {
+				if prep == nil {
+					if c.Audit != nil {
+						c.Audit.fail("%s: %s: %s: error preparing query: database connection required",
+							query.Filename, query.Name, name)
+					} else {
 						fmt.Fprintf(c.Stderr, "%s: %s: %s: error preparing query: database connection required\n", query.Filename, query.Name, name)
-						errored = true
-						continue
 					}
-					prepName := fmt.Sprintf("sqlc_vet_%d_%d", time.Now().Unix(), i)
-					if err := prep.Prepare(ctx, prepName, query.Text); err != nil {
+					errored = true
+					continue
+				}
+				prepName := fmt.Sprintf("sqlc_vet_%d_%d", time.Now().Unix(), i)
+				if err := prep.Prepare(ctx, prepName, query.Text); err != nil {
+					if c.Audit != nil {
+						// A failed prepare is the built-in sqlc/db-prepare
+						// rule tripping, not a rule execution failure.
+						c.recordFinding(rule, name, query, locator, err.Error())
+					} else {
 						fmt.Fprintf(c.Stderr, "%s: %s: %s: error preparing query: %s\n", query.Filename, query.Name, name, err)
 						errored = true
-						continue
 					}
+					continue
 				}
+			}
 
-				// short-circuit for "sqlc/db-prepare" rule which doesn't have a CEL program
-				if rule.Program == nil {
+			// short-circuit for "sqlc/db-prepare" rule which doesn't have a CEL program
+			if rule.Program == nil {
+				continue
+			}
+
+			// Get explain output for this query if we need it
+			_, pgsqlOK := evalMap["postgresql"]
+			_, mysqlOK := evalMap["mysql"]
+			if rule.NeedsExplain && !(pgsqlOK || mysqlOK) {
+				if expl == nil {
+					if c.Audit != nil {
+						c.Audit.fail("%s: %s: %s: error explaining query: database connection required",
+							query.Filename, query.Name, name)
+					} else {
+						fmt.Fprintf(c.Stderr, "%s: %s: %s: error explaining query: database connection required\n", query.Filename, query.Name, name)
+					}
+					errored = true
+					continue
+				}
+				engineOutput, err := expl.Explain(ctx, query.Text, query.Params...)
+				if err != nil {
+					if c.Audit != nil {
+						c.Audit.fail("%s: %s: %s: error explaining query: %s",
+							query.Filename, query.Name, name, err)
+					} else {
+						fmt.Fprintf(c.Stderr, "%s: %s: %s: error explaining query: %s\n", query.Filename, query.Name, name, err)
+					}
+					errored = true
 					continue
 				}
 
-				// Get explain output for this query if we need it
-				_, pgsqlOK := evalMap["postgresql"]
-				_, mysqlOK := evalMap["mysql"]
-				if rule.NeedsExplain && !(pgsqlOK || mysqlOK) {
-					if expl == nil {
-						fmt.Fprintf(c.Stderr, "%s: %s: %s: error explaining query: database connection required\n", query.Filename, query.Name, name)
-						errored = true
-						continue
-					}
-					engineOutput, err := expl.Explain(ctx, query.Text, query.Params...)
-					if err != nil {
-						fmt.Fprintf(c.Stderr, "%s: %s: %s: error explaining query: %s\n", query.Filename, query.Name, name, err)
-						errored = true
-						continue
-					}
+				evalMap["postgresql"] = engineOutput.PostgreSQL
+				evalMap["mysql"] = engineOutput.MySQL
+			}
 
-					evalMap["postgresql"] = engineOutput.PostgreSQL
-					evalMap["mysql"] = engineOutput.MySQL
-				}
+			if debugDumpVetEnv.Value() == "1" {
+				fmt.Printf("vars for rule '%s' evaluating against query '%s':\n", name, query.Name)
+				debug.DumpAsJSON(evalMap)
+			}
 
-				if debugDumpVetEnv.Value() == "1" {
-					fmt.Printf("vars for rule '%s' evaluating against query '%s':\n", name, query.Name)
-					debug.DumpAsJSON(evalMap)
+			out, _, err := (*rule.Program).Eval(evalMap)
+			if err != nil {
+				if c.Audit != nil {
+					c.Audit.fail("%s: %s: %s: rule execution error: %s",
+						query.Filename, query.Name, name, err)
+					return ErrFailedChecks
 				}
-
-				out, _, err := (*rule.Program).Eval(evalMap)
-				if err != nil {
-					return err
+				return err
+			}
+			tripped, ok := out.Value().(bool)
+			if !ok {
+				if c.Audit != nil {
+					c.Audit.fail("%s: %s: %s: expression returned non-bool value: %v",
+						query.Filename, query.Name, name, out.Value())
+					return ErrFailedChecks
 				}
-				tripped, ok := out.Value().(bool)
-				if !ok {
-					return fmt.Errorf("expression returned non-bool value: %v", out.Value())
-				}
-				if tripped {
+				return fmt.Errorf("expression returned non-bool value: %v", out.Value())
+			}
+			if tripped {
+				if c.Audit != nil {
+					c.recordFinding(rule, name, query, locator, rule.Message)
+				} else {
 					// TODO: Get line numbers in the output
 					if rule.Message == "" {
 						fmt.Fprintf(c.Stderr, "%s: %s: %s\n", query.Filename, query.Name, name)

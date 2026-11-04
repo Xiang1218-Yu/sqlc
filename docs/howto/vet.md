@@ -88,6 +88,20 @@ rules:
       query.cmd == "exec"
 ```
 
+Each rule may declare a `severity` of `info`, `warning` or `error`. Rules
+without a severity default to `error`. The severity is recorded in the
+audit baseline and used by the audit failure gate; see
+[Audit workflow](#audit-workflow).
+
+```yaml
+rules:
+  - name: no-exec
+    severity: warning
+    message: "don't use exec"
+    rule: |
+      query.cmd == "exec"
+```
+
 ### Rules using `EXPLAIN ...` output
 
 *Added in v1.20.0*
@@ -276,7 +290,7 @@ SELECT * FROM authors
 WHERE id = ? LIMIT 1;
 ```
 
-To skip all rules for a query, you can provide the `@sqlc-vet-disable` annotation without any parameters. 
+To skip all rules for a query, you can provide the `@sqlc-vet-disable` annotation without any parameters.
 
 ```sql
 /* name: GetAuthor :one */
@@ -284,3 +298,100 @@ To skip all rules for a query, you can provide the `@sqlc-vet-disable` annotatio
 SELECT * FROM authors
 WHERE id = ? LIMIT 1;
 ```
+
+## Audit workflow
+
+The audit flow turns `sqlc vet` results into an auditable quality gate. It
+is **explicitly opt-in**: it runs only when `--audit-baseline` is passed,
+and every other command (`generate`, `diff`, `verify`) and plain
+`sqlc vet` invocations keep their existing behavior.
+
+### Creating and refreshing the baseline
+
+```sh
+# Create (or replace) the baseline for all configured packages and rules.
+sqlc vet --audit-baseline .sqlc/vet-baseline.json --audit-update \
+  --audit-report .sqlc/vet-report.txt --audit-json .sqlc/vet-report.json
+```
+
+The baseline is a deterministic JSON document recording:
+
+- the sqlc configuration file (path and SHA-256 digest) and sqlc version;
+- each audited package: name, engine, schema and query files with their
+  SHA-256 digests, and the rules applied to it;
+- the identity of every audited rule (its CEL expression, message and
+  severity);
+- every diagnostic (package, query, rule, message, severity, file and
+  line), sorted deterministically.
+
+The document contains no timestamps, so identical inputs always produce
+an identical baseline.
+
+### Comparing against the baseline
+
+Without `--audit-update` the baseline is never modified; the current
+results are compared to it:
+
+```sh
+sqlc vet --audit-baseline .sqlc/vet-baseline.json \
+  --audit-report .sqlc/vet-report.txt --audit-json .sqlc/vet-report.json
+```
+
+Each diagnostic is identified by `package + query name + rule`; its
+position, message and severity are compared against the baseline, yielding
+one of six change types:
+
+| Change     | Meaning                                                        |
+|------------|----------------------------------------------------------------|
+| `new`      | present in the current results, absent from the baseline       |
+| `resolved` | present in the baseline, no longer reported                    |
+| `unchanged`| identical position, message and severity                       |
+| `moved`    | same diagnostic at a different file or line                    |
+| `message`  | the diagnostic message changed                                 |
+| `severity` | the rule severity changed (takes precedence over message/move) |
+
+Both a human-readable text report (printed to stdout and, when requested,
+written atomically to `--audit-report`) and a machine-readable JSON report
+(`--audit-json`) are produced. Every section and array in the reports uses
+a fixed, deterministic order, so repeated runs and interrupted re-runs
+produce identical reports.
+
+### Filtering
+
+The audit can be scoped and filtered; all filters are repeatable and
+accept comma-separated values. Unknown package, rule or change-type values
+are rejected before any package is checked and no file is written.
+
+```sh
+sqlc vet --audit-baseline .sqlc/vet-baseline.json \
+  --audit-package db --audit-rule no-delete \
+  --audit-change new,resolved
+```
+
+- `--audit-package`: only audit the named packages.
+- `--audit-rule`: only evaluate and compare the named rules.
+- `--audit-change`: only include the listed change types in the report
+  and failure gate (`new`, `resolved`, `unchanged`, `moved`, `message`,
+  `severity`).
+
+### Failure gate
+
+`--audit-fail-on` sets the severity threshold of the quality gate
+(`info`, `warning` or `error`; default `error`). Comparing exits non-zero
+only when a current result introduces a problem at or above the threshold:
+
+- a `new` diagnostic at or above the threshold, or
+- a `severity` increase whose new severity is at or above the threshold.
+
+Resolved, unchanged and merely moved/edited diagnostics, and severity
+decreases, never fail the gate. The gate is evaluated over the filtered
+changes, so a given filter combination always has the same exit status.
+Gate failures still write the reports, but never modify the baseline.
+
+### Atomicity and failures
+
+Baselines and reports are published via same-directory temporary files and
+atomic renames; when multiple files are written, all are fully staged
+before any rename. If any package fails to check, any rule fails to
+execute, a filter is invalid or an artifact cannot be written, the command
+fails without replacing any existing baseline or report.

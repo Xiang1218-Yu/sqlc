@@ -103,9 +103,10 @@ type Plugin struct {
 }
 
 type Rule struct {
-	Name string `json:"name" yaml:"name"`
-	Rule string `json:"rule" yaml:"rule"`
-	Msg  string `json:"message" yaml:"message"`
+	Name     string `json:"name" yaml:"name"`
+	Rule     string `json:"rule" yaml:"rule"`
+	Msg      string `json:"message" yaml:"message"`
+	Severity string `json:"severity,omitempty" yaml:"severity,omitempty"`
 }
 
 type Overrides struct {
